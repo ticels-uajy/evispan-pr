@@ -1,0 +1,8 @@
+streamlit>=1.40,<2
+numpy>=1.24
+pandas>=2.0
+torch>=2.1
+transformers>=4.40
+pytorch-crf>=0.7.2
+safetensors>=0.4
+sentencepiece>=0.2
