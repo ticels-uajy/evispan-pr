@@ -2,20 +2,21 @@ from __future__ import annotations
 
 import hashlib
 import html
-import io
 import json
 import os
+import re
 import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List
 
 import pandas as pd
 import streamlit as st
 
-from evispan_model import LABELS, load_artifacts, predict_text
 
+
+LABELS = ["Problem", "Suggestion", "Neutral", "Appreciation"]
 
 st.set_page_config(
     page_title="EviSpan-PR: Evidence-Grounded Peer Review Feedback Analysis",
@@ -62,6 +63,12 @@ PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_ARTIFACT_DIR = Path(
     os.getenv("EVISPAN_ARTIFACT_DIR", str(PROJECT_DIR / "artifacts" / "evispan_pr"))
 )
+DEFAULT_PREDICTION_PATH = Path(
+    os.getenv(
+        "EVISPAN_TEST_PREDICTIONS",
+        str(DEFAULT_ARTIFACT_DIR / "test_predictions.jsonl"),
+    )
+)
 RESPONSE_DB_PATH = Path(
     os.getenv(
         "EVISPAN_RESPONSE_DB",
@@ -73,24 +80,24 @@ TTF_QUESTIONNAIRE_URL = os.getenv(
     "https://forms.gle/REPLACE_WITH_YOUR_TTF_FORM_ID",
 ).strip()
 DEFAULT_REVIEW_TARGET = max(1, int(os.getenv("EVISPAN_REVIEW_TARGET", "10")))
-
-TEXT_COLUMN_CANDIDATES = [
-    "text",
-    "comment",
-    "feedback",
-    "review",
-    "sentence",
-    "content",
-    "peer_feedback",
-]
-ID_COLUMN_CANDIDATES = ["id", "sample_id", "row_id", "comment_id", "index"]
+RESPONDENT_CODE_PREFIX = (os.getenv("EVISPAN_RESPONDENT_PREFIX", "D").strip().upper() or "D")
+RESPONDENT_CODE_WIDTH = max(3, int(os.getenv("EVISPAN_RESPONDENT_CODE_WIDTH", "4")))
+CONSENT_VERSION = "2026-07-v1"
+CONSENT_TEXT = (
+    "Saya bersedia terlibat sebagai responden dalam penelitian EviSpan-PR. Saya memahami "
+    "bahwa partisipasi ini bersifat sukarela dan respons yang saya berikan akan digunakan "
+    "untuk kepentingan penelitian dan evaluasi sistem. Data pribadi tidak akan disalahgunakan. "
+    "Identitas dan data pribadi akan disamarkan serta tidak ditampilkan dalam proses analisis, "
+    "pelaporan, maupun publikasi hasil penelitian."
+)
 
 STUDY_STATE_KEYS = [
     "study_session_id",
     "study_phase",
     "review_indices",
     "review_position",
-    "review_page_jump",
+    "top_review_page_jump",
+    "bottom_review_page_jump",
     "study_responses",
     "respondent_code",
     "respondent_name",
@@ -106,14 +113,20 @@ def utc_now_iso() -> str:
 
 
 @st.cache_data(show_spinner=False)
-def read_test_dataset(data: bytes, filename: str) -> pd.DataFrame:
-    """Read an uploaded CSV, JSON, or JSONL test dataset."""
-    suffix = Path(filename).suffix.lower()
+def read_prediction_file(path_text: str, modified_time_ns: int) -> pd.DataFrame:
+    """Read and normalize precomputed predictions from JSON or JSONL."""
+    del modified_time_ns  # Included only to invalidate Streamlit cache when the file changes.
+    path = Path(path_text)
+    suffix = path.suffix.lower()
 
-    if suffix == ".csv":
-        frame = pd.read_csv(io.BytesIO(data))
+    if suffix in {".jsonl", ".ndjson"}:
+        records = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8-sig").splitlines()
+            if line.strip()
+        ]
     elif suffix == ".json":
-        parsed = json.loads(data.decode("utf-8-sig"))
+        parsed = json.loads(path.read_text(encoding="utf-8-sig"))
         if isinstance(parsed, list):
             records = parsed
         elif isinstance(parsed, dict):
@@ -126,54 +139,145 @@ def read_test_dataset(data: bytes, filename: str) -> pd.DataFrame:
                 [parsed],
             )
         else:
-            raise ValueError("JSON harus berisi objek atau daftar objek.")
-        frame = pd.json_normalize(records)
-    elif suffix in {".jsonl", ".ndjson"}:
-        records = [
-            json.loads(line)
-            for line in data.decode("utf-8-sig").splitlines()
-            if line.strip()
-        ]
-        frame = pd.json_normalize(records)
+            raise ValueError("File prediksi JSON harus berisi objek atau daftar objek.")
     else:
-        raise ValueError("Format tidak didukung. Gunakan CSV, JSON, JSONL, atau NDJSON.")
+        raise ValueError("File prediksi harus menggunakan format JSONL, NDJSON, atau JSON.")
 
+    if not records:
+        raise ValueError("File test_predictions tidak memiliki data.")
+
+    normalized = [normalize_prediction_record(record, index) for index, record in enumerate(records)]
+    frame = pd.DataFrame(normalized)
+    frame = frame[frame["text"].str.strip().ne("")].reset_index(drop=True)
     if frame.empty:
-        raise ValueError("Test dataset tidak memiliki baris data.")
-    if frame.columns.duplicated().any():
-        duplicated = frame.columns[frame.columns.duplicated()].tolist()
-        raise ValueError(f"Nama kolom duplikat tidak didukung: {duplicated}")
-
-    return frame.reset_index(drop=True)
-
-
-def preferred_column(
-    columns: Iterable[str],
-    candidates: List[str],
-    fallback_to_first: bool = True,
-) -> Optional[str]:
-    columns = list(columns)
-    lower_to_original = {str(column).lower(): str(column) for column in columns}
-    for candidate in candidates:
-        if candidate in lower_to_original:
-            return lower_to_original[candidate]
-    return str(columns[0]) if columns and fallback_to_first else None
+        raise ValueError("Tidak ada teks komentar yang dapat ditampilkan.")
+    if not frame["prediction_fields_present"].all():
+        raise ValueError(
+            "Sebagian baris tidak memiliki field hasil prediksi. Pastikan file memuat "
+            "predicted_labels, label_probabilities, dan predicted_spans."
+        )
+    return frame
 
 
-def artifact_is_complete(path: Path) -> bool:
-    required = [
-        path / "artifact_config.json",
-        path / "thresholds.json",
-        path / "model_state.pt",
-        path / "encoder_config" / "config.json",
-        path / "tokenizer",
-    ]
-    return all(item.exists() for item in required)
+def parse_json_like(value: Any, default: Any) -> Any:
+    if value is None:
+        return default
+    if isinstance(value, float) and pd.isna(value):
+        return default
+    if isinstance(value, (list, dict)):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return default
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            if isinstance(default, list):
+                return [part.strip() for part in stripped.split(",") if part.strip()]
+    return default
 
 
-@st.cache_resource(show_spinner="Memuat model EviSpan-PR...")
-def get_live_model(artifact_dir: str):
-    return load_artifacts(artifact_dir)
+def first_present(record: Dict[str, Any], keys: List[str], default: Any) -> Any:
+    for key in keys:
+        if key in record and record[key] is not None:
+            return record[key]
+    return default
+
+
+def normalize_spans(spans: Any, text: str) -> List[Dict[str, Any]]:
+    parsed = parse_json_like(spans, [])
+    if not isinstance(parsed, list):
+        return []
+
+    output: List[Dict[str, Any]] = []
+    for span in parsed:
+        if not isinstance(span, dict):
+            continue
+        label = str(span.get("label", ""))
+        if label not in LABELS:
+            continue
+        try:
+            start = int(span.get("start"))
+            end = int(span.get("end"))
+        except (TypeError, ValueError):
+            continue
+        start = max(0, min(start, len(text)))
+        end = max(0, min(end, len(text)))
+        if start >= end:
+            continue
+        output.append(
+            {
+                "start": start,
+                "end": end,
+                "label": label,
+                "text": str(span.get("text") or text[start:end]),
+            }
+        )
+    return sorted(output, key=lambda item: (item["start"], item["end"], item["label"]))
+
+
+def normalize_prediction_record(record: Any, index: int) -> Dict[str, Any]:
+    if not isinstance(record, dict):
+        raise ValueError(f"Baris ke-{index + 1} bukan objek JSON yang valid.")
+
+    text = str(
+        first_present(
+            record,
+            ["text", "comment", "feedback", "review", "sentence", "content", "peer_feedback"],
+            "",
+        )
+    ).strip()
+    row_id = first_present(record, ["id", "sample_id", "row_id", "comment_id"], index + 1)
+
+    predicted_labels_raw = parse_json_like(
+        first_present(record, ["predicted_labels", "pred_labels"], []),
+        [],
+    )
+    predicted_labels = [
+        str(label) for label in predicted_labels_raw if str(label) in LABELS
+    ] if isinstance(predicted_labels_raw, list) else []
+
+    probabilities_raw = parse_json_like(
+        first_present(record, ["label_probabilities", "pred_probs", "probabilities"], {}),
+        {},
+    )
+    if not isinstance(probabilities_raw, dict):
+        probabilities_raw = {}
+
+    probabilities: Dict[str, float] = {}
+    for label in LABELS:
+        candidates = [
+            probabilities_raw.get(label),
+            probabilities_raw.get(label.lower()),
+            record.get(f"prob_{label.lower()}"),
+        ]
+        value = next((candidate for candidate in candidates if candidate is not None), 0.0)
+        try:
+            probabilities[label] = float(value)
+        except (TypeError, ValueError):
+            probabilities[label] = 0.0
+
+    spans_raw = first_present(record, ["predicted_spans", "pred_spans"], [])
+    label_fields = {"predicted_labels", "pred_labels"}
+    probability_fields = {"label_probabilities", "pred_probs", "probabilities"}
+    span_fields = {"predicted_spans", "pred_spans"}
+    prediction_fields_present = (
+        bool(label_fields.intersection(record.keys()))
+        and bool(probability_fields.intersection(record.keys()))
+        and bool(span_fields.intersection(record.keys()))
+    )
+
+    return {
+        "source_row_index": index,
+        "row_id": str(row_id),
+        "text": text,
+        "predicted_labels": predicted_labels,
+        "label_probabilities": probabilities,
+        "predicted_spans": normalize_spans(spans_raw, text),
+        "truncated": bool(record.get("truncated", False)),
+        "prediction_fields_present": prediction_fields_present,
+    }
 
 
 def render_label_guide() -> str:
@@ -300,6 +404,119 @@ def probabilities_dataframe(result: Dict[str, Any]) -> pd.DataFrame:
     )
 
 
+def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
+    return {
+        str(row[1])
+        for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+
+
+def _ensure_column(
+    connection: sqlite3.Connection,
+    table_name: str,
+    column_name: str,
+    column_definition: str,
+) -> None:
+    if column_name not in _table_columns(connection, table_name):
+        connection.execute(
+            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}"
+        )
+
+
+def _respondent_number_from_code(code: Any) -> int | None:
+    match = re.fullmatch(
+        rf"{re.escape(RESPONDENT_CODE_PREFIX)}-(\d+)",
+        str(code or "").strip().upper(),
+    )
+    return int(match.group(1)) if match else None
+
+
+def _ensure_respondent_counter(connection: sqlite3.Connection) -> int:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_counters (
+            counter_name TEXT PRIMARY KEY,
+            counter_value INTEGER NOT NULL
+        )
+        """
+    )
+    row = connection.execute(
+        "SELECT counter_value FROM app_counters WHERE counter_name='respondent_code'"
+    ).fetchone()
+    if row is not None:
+        return int(row[0])
+
+    existing_codes = [
+        row[0]
+        for row in connection.execute(
+            "SELECT respondent_code FROM study_sessions WHERE respondent_code IS NOT NULL"
+        ).fetchall()
+    ]
+    existing_codes.extend(
+        row[0]
+        for row in connection.execute(
+            "SELECT respondent_code FROM respondent_registry WHERE respondent_code IS NOT NULL"
+        ).fetchall()
+    )
+    existing_numbers = [
+        number
+        for code in existing_codes
+        if (number := _respondent_number_from_code(code)) is not None
+    ]
+    current = max(existing_numbers, default=0)
+    connection.execute(
+        "INSERT INTO app_counters(counter_name, counter_value) VALUES ('respondent_code', ?)",
+        (current,),
+    )
+    return current
+
+
+def _format_respondent_code(number: int) -> str:
+    return f"{RESPONDENT_CODE_PREFIX}-{number:0{RESPONDENT_CODE_WIDTH}d}"
+
+
+def _next_available_respondent_code(
+    connection: sqlite3.Connection,
+    reserve_for_session_id: str | None = None,
+) -> str:
+    current = _ensure_respondent_counter(connection)
+    while True:
+        current += 1
+        candidate = _format_respondent_code(current)
+        exists = connection.execute(
+            """
+            SELECT 1 FROM study_sessions WHERE respondent_code = ?
+            UNION ALL
+            SELECT 1 FROM respondent_registry WHERE respondent_code = ?
+            LIMIT 1
+            """,
+            (candidate, candidate),
+        ).fetchone()
+        if exists is None:
+            break
+
+    if reserve_for_session_id is not None:
+        connection.execute(
+            "UPDATE app_counters SET counter_value=? WHERE counter_name='respondent_code'",
+            (current,),
+        )
+        connection.execute(
+            """
+            INSERT INTO respondent_registry (
+                respondent_code, session_id, created_at
+            ) VALUES (?, ?, ?)
+            """,
+            (candidate, reserve_for_session_id, utc_now_iso()),
+        )
+    return candidate
+
+
+def preview_next_respondent_code(path: Path) -> str:
+    with sqlite3.connect(path, timeout=30) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        return _next_available_respondent_code(connection)
+
+
 def initialise_database(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path, timeout=30) as connection:
@@ -320,7 +537,22 @@ def initialise_database(path: Path) -> None:
                 sampling_method TEXT NOT NULL,
                 review_indices_json TEXT NOT NULL,
                 started_at TEXT NOT NULL,
-                completed_at TEXT
+                completed_at TEXT,
+                consent_given INTEGER NOT NULL DEFAULT 0,
+                consent_version TEXT,
+                consent_text TEXT,
+                consented_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS respondent_registry (
+                respondent_code TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS app_counters (
+                counter_name TEXT PRIMARY KEY,
+                counter_value INTEGER NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS comment_responses (
@@ -359,22 +591,52 @@ def initialise_database(path: Path) -> None:
             );
             """
         )
+
+        # Backward-compatible migration for databases created by earlier app versions.
+        _ensure_column(connection, "study_sessions", "consent_given", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(connection, "study_sessions", "consent_version", "TEXT")
+        _ensure_column(connection, "study_sessions", "consent_text", "TEXT")
+        _ensure_column(connection, "study_sessions", "consented_at", "TEXT")
+
+        # Register historical respondent codes when possible. INSERT OR IGNORE keeps
+        # legacy duplicate codes from breaking migration while all new IDs are reserved
+        # atomically through respondent_registry.
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO respondent_registry (
+                respondent_code, session_id, created_at
+            )
+            SELECT respondent_code, session_id, started_at
+            FROM study_sessions
+            WHERE respondent_code IS NOT NULL AND TRIM(respondent_code) <> ''
+            """
+        )
+        _ensure_respondent_counter(connection)
         connection.commit()
 
 
-def create_study_session(path: Path, payload: Dict[str, Any]) -> None:
-    with sqlite3.connect(path, timeout=30) as connection:
+def create_study_session(path: Path, payload: Dict[str, Any]) -> str:
+    """Create a session and atomically reserve a unique respondent code."""
+    connection = sqlite3.connect(path, timeout=30, isolation_level=None)
+    try:
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("BEGIN IMMEDIATE")
+        respondent_code = _next_available_respondent_code(
+            connection,
+            reserve_for_session_id=payload["session_id"],
+        )
         connection.execute(
             """
             INSERT INTO study_sessions (
                 session_id, respondent_code, respondent_name, respondent_unit,
                 dataset_name, dataset_signature, text_column, id_column,
-                review_target, sampling_method, review_indices_json, started_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                review_target, sampling_method, review_indices_json, started_at,
+                consent_given, consent_version, consent_text, consented_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payload["session_id"],
-                payload["respondent_code"],
+                respondent_code,
                 payload.get("respondent_name", ""),
                 payload.get("respondent_unit", ""),
                 payload["dataset_name"],
@@ -385,10 +647,19 @@ def create_study_session(path: Path, payload: Dict[str, Any]) -> None:
                 payload["sampling_method"],
                 json.dumps(payload["review_indices"]),
                 payload["started_at"],
+                1 if payload.get("consent_given") else 0,
+                payload.get("consent_version", CONSENT_VERSION),
+                payload.get("consent_text", CONSENT_TEXT),
+                payload.get("consented_at", payload["started_at"]),
             ),
         )
         connection.commit()
-
+        return respondent_code
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 def save_comment_response(path: Path, payload: Dict[str, Any]) -> None:
     with sqlite3.connect(path, timeout=30) as connection:
@@ -489,6 +760,9 @@ def session_responses_dataframe(path: Path, session_id: str) -> pd.DataFrame:
                 s.respondent_code,
                 s.respondent_name,
                 s.respondent_unit,
+                s.consent_given,
+                s.consent_version,
+                s.consented_at,
                 s.dataset_name,
                 c.review_order,
                 c.source_row_index,
@@ -525,6 +799,9 @@ def session_final_dataframe(path: Path, session_id: str) -> pd.DataFrame:
                 s.respondent_code,
                 s.respondent_name,
                 s.respondent_unit,
+                s.consent_given,
+                s.consent_version,
+                s.consented_at,
                 f.easiest_label,
                 f.hardest_label,
                 f.recurring_patterns,
@@ -569,7 +846,6 @@ def reset_study_state() -> None:
 def _set_review_position(index: int, total: int) -> None:
     bounded = max(0, min(index, total - 1))
     st.session_state.review_position = bounded
-    st.session_state.review_page_jump = bounded + 1
 
 
 def _previous_review(total: int) -> None:
@@ -580,12 +856,13 @@ def _next_review(total: int) -> None:
     _set_review_position(int(st.session_state.review_position) + 1, total)
 
 
-def _jump_review(total: int) -> None:
-    requested = int(st.session_state.review_page_jump) - 1
-    st.session_state.review_position = max(0, min(requested, total - 1))
+def _jump_review(total: int, widget_key: str) -> None:
+    requested = int(st.session_state[widget_key]) - 1
+    _set_review_position(requested, total)
 
 
 def render_review_navigation(total: int, key_prefix: str) -> None:
+    """Render independent top/bottom navigation widgets with unique Streamlit keys."""
     current = int(st.session_state.review_position)
     previous_col, page_col, next_col = st.columns([1, 2, 1])
     previous_col.button(
@@ -596,14 +873,19 @@ def render_review_navigation(total: int, key_prefix: str) -> None:
         on_click=_previous_review,
         args=(total,),
     )
+
+    page_key = f"{key_prefix}_review_page_jump"
+    # The top and bottom number inputs must use different keys. Synchronize each
+    # widget to the currently active record before it is instantiated.
+    st.session_state[page_key] = current + 1
     page_col.number_input(
         "Komentar",
         min_value=1,
         max_value=total,
         step=1,
-        key="review_page_jump",
+        key=page_key,
         on_change=_jump_review,
-        args=(total,),
+        args=(total, page_key),
         label_visibility="collapsed",
     )
     next_col.button(
@@ -703,23 +985,28 @@ except Exception as exc:
     database_ready = False
     database_error = str(exc)
 
+prediction_candidates = [
+    DEFAULT_PREDICTION_PATH.expanduser(),
+    PROJECT_DIR / "artifacts" / "test_predictions.jsonl",
+]
+prediction_path = next(
+    (candidate.resolve() for candidate in prediction_candidates if candidate.exists()),
+    prediction_candidates[0].resolve(),
+)
+
 with st.sidebar:
     st.header("Konfigurasi studi")
-    uploaded = st.file_uploader(
-        "Upload test dataset",
-        type=["csv", "json", "jsonl", "ndjson"],
-        help="Dataset harus memiliki minimal satu kolom teks.",
-    )
-    artifact_dir_text = st.text_input(
-        "Model artifact directory",
-        value=str(DEFAULT_ARTIFACT_DIR),
-        help="Folder berisi model_state.pt, thresholds.json, tokenizer, dan encoder_config.",
+    st.markdown("**Sumber data prediksi**")
+    st.caption(f"`{prediction_path}`")
+    st.caption(
+        "Komentar, label, probabilitas, dan evidence span dibaca otomatis dari "
+        "`test_predictions.jsonl`; dosen tidak perlu mengunggah dataset."
     )
     st.caption(f"Penyimpanan respons: `{RESPONSE_DB_PATH}`")
     if not database_ready:
         st.error(f"Database respons tidak dapat digunakan: {database_error}")
 
-if uploaded is None:
+if not prediction_path.exists():
     render_workflow("setup", 0, 0)
     with st.expander("1. Pelajari kategori feedback", expanded=True):
         st.markdown(
@@ -727,57 +1014,41 @@ if uploaded is None:
             "memulai evaluasi."
         )
         st.markdown(render_label_guide(), unsafe_allow_html=True)
-    st.info("Upload test dataset melalui panel sebelah kiri untuk memulai sesi evaluasi.")
+    st.error(
+        "File hasil prediksi tidak ditemukan. Letakkan `test_predictions.jsonl` pada folder "
+        "artifact yang dikonfigurasi."
+    )
+    st.code(str(prediction_path), language="text")
+    st.caption(
+        "Lokasi dapat diubah melalui environment variable `EVISPAN_TEST_PREDICTIONS`."
+    )
     st.stop()
 
 try:
-    uploaded_bytes = uploaded.getvalue()
-    test_df = read_test_dataset(uploaded_bytes, uploaded.name)
+    prediction_stat = prediction_path.stat()
+    test_df = read_prediction_file(str(prediction_path), prediction_stat.st_mtime_ns)
 except Exception as exc:
-    st.error(f"Test dataset tidak dapat dibaca: {exc}")
+    st.error(f"File test_predictions.jsonl tidak dapat dibaca: {exc}")
+    st.code(str(prediction_path), language="text")
     st.stop()
 
-available_columns = [str(column) for column in test_df.columns]
-default_text_column = preferred_column(available_columns, TEXT_COLUMN_CANDIDATES)
-default_text_index = available_columns.index(default_text_column) if default_text_column in available_columns else 0
+working_df = test_df.copy().reset_index(drop=True)
+text_column = "text"
+id_column_selection = "row_id"
 
 with st.sidebar:
-    text_column = st.selectbox("Kolom teks", options=available_columns, index=default_text_index)
+    st.success(f"{len(working_df):,} komentar prediksi siap ditelaah.")
 
-    id_options = ["(gunakan nomor baris)"] + available_columns
-    preferred_id = preferred_column(available_columns, ID_COLUMN_CANDIDATES, fallback_to_first=False)
-    default_id_index = id_options.index(preferred_id) if preferred_id in id_options else 0
-    id_column_selection = st.selectbox("Kolom ID", options=id_options, index=default_id_index)
-
-working_df = test_df.copy()
-working_df[text_column] = working_df[text_column].fillna("").astype(str)
-working_df = working_df[working_df[text_column].str.strip().ne("")].reset_index(drop=True)
-if working_df.empty:
-    st.error(f"Kolom `{text_column}` tidak memiliki teks yang dapat diprediksi.")
-    st.stop()
-
-artifact_dir = Path(artifact_dir_text).expanduser().resolve()
-if not artifact_is_complete(artifact_dir):
-    st.error(
-        "Model artifact belum lengkap. Pastikan folder berisi `artifact_config.json`, "
-        "`thresholds.json`, `model_state.pt`, `encoder_config/config.json`, dan folder `tokenizer`."
-    )
-    st.code(str(artifact_dir), language="text")
-    st.stop()
-
-file_signature = hashlib.sha256(uploaded_bytes).hexdigest()
-dataset_signature = f"{file_signature}:{text_column}:{id_column_selection}:{len(working_df)}"
-model_state_path = artifact_dir / "model_state.pt"
-model_signature = f"{artifact_dir}:{model_state_path.stat().st_mtime_ns}"
-study_signature = f"{dataset_signature}:{model_signature}"
+dataset_signature = (
+    f"{prediction_path}:{prediction_stat.st_size}:{prediction_stat.st_mtime_ns}:"
+    f"{len(working_df)}"
+)
+study_signature = dataset_signature
 
 if st.session_state.get("active_study_signature") != study_signature:
     reset_study_state()
     st.session_state.active_study_signature = study_signature
-    st.session_state.prediction_cache = {}
 
-if "prediction_cache" not in st.session_state:
-    st.session_state.prediction_cache = {}
 if "study_responses" not in st.session_state:
     st.session_state.study_responses = {}
 
@@ -802,17 +1073,31 @@ if not database_ready:
 if "study_session_id" not in st.session_state:
     st.subheader("Mulai sesi evaluasi dosen")
     st.markdown(
-        "Isi identitas responden, tentukan jumlah komentar yang akan ditelaah, lalu mulai sesi. "
-        "Nama bersifat opsional; kode responden digunakan untuk membedakan data respons."
+        "Kode responden dibuat otomatis dari database SQLite agar setiap responden memiliki ID "
+        "yang unik. Nama dan unit bersifat opsional."
     )
 
     max_target = len(working_df)
     default_target = min(DEFAULT_REVIEW_TARGET, max_target)
+    try:
+        respondent_code_preview = (
+            preview_next_respondent_code(RESPONSE_DB_PATH)
+            if database_ready
+            else "Database belum tersedia"
+        )
+    except Exception as exc:
+        respondent_code_preview = "Tidak dapat dibuat"
+        st.warning(f"Pratinjau kode responden tidak tersedia: {exc}")
+
     with st.form("study_setup_form"):
-        respondent_code = st.text_input(
-            "Kode responden *",
-            placeholder="Contoh: D-001",
-            help="Gunakan kode anonim bila penelitian tidak memerlukan nama dosen.",
+        st.text_input(
+            "Kode responden (otomatis)",
+            value=respondent_code_preview,
+            disabled=True,
+            help=(
+                "Kode final dialokasikan secara atomik ketika sesi dimulai dan diperiksa terhadap "
+                "seluruh kode yang sudah tersimpan di SQLite."
+            ),
         )
         respondent_name = st.text_input("Nama dosen (opsional)")
         respondent_unit = st.text_input("Program studi/unit (opsional)")
@@ -829,11 +1114,18 @@ if "study_session_id" not in st.session_state:
             horizontal=True,
             help="Pemilihan acak menggunakan seed tetap untuk sesi ini sehingga urutan tidak berubah.",
         )
-        begin = st.form_submit_button("Mulai menggunakan EviSpan-PR", type="primary")
+
+        st.markdown("#### Persetujuan partisipasi (consent form)")
+        st.info(CONSENT_TEXT)
+        consent_given = st.checkbox(
+            "Saya telah membaca penjelasan di atas dan bersedia terlibat dalam penelitian ini. *",
+            value=False,
+        )
+        begin = st.form_submit_button("Setuju dan mulai menggunakan EviSpan-PR", type="primary")
 
     if begin:
-        if not respondent_code.strip():
-            st.error("Kode responden wajib diisi.")
+        if not consent_given:
+            st.error("Persetujuan partisipasi wajib diberikan sebelum sesi dimulai.")
             st.stop()
         if not database_ready:
             st.error("Sesi tidak dapat dimulai sebelum database respons tersedia.")
@@ -848,35 +1140,38 @@ if "study_session_id" not in st.session_state:
         else:
             review_indices = list(range(target))
 
+        started_at = utc_now_iso()
         session_payload = {
             "session_id": session_id,
-            "respondent_code": respondent_code.strip(),
             "respondent_name": respondent_name.strip(),
             "respondent_unit": respondent_unit.strip(),
-            "dataset_name": uploaded.name,
+            "dataset_name": prediction_path.name,
             "dataset_signature": dataset_signature,
             "text_column": text_column,
-            "id_column": "" if id_column_selection == "(gunakan nomor baris)" else id_column_selection,
+            "id_column": id_column_selection,
             "review_target": target,
             "sampling_method": sampling_method,
             "review_indices": review_indices,
-            "started_at": utc_now_iso(),
+            "started_at": started_at,
+            "consent_given": True,
+            "consent_version": CONSENT_VERSION,
+            "consent_text": CONSENT_TEXT,
+            "consented_at": started_at,
         }
         try:
-            create_study_session(RESPONSE_DB_PATH, session_payload)
+            respondent_code = create_study_session(RESPONSE_DB_PATH, session_payload)
         except Exception as exc:
             st.error(f"Sesi tidak dapat disimpan: {exc}")
             st.stop()
 
         st.session_state.study_session_id = session_id
-        st.session_state.respondent_code = respondent_code.strip()
+        st.session_state.respondent_code = respondent_code
         st.session_state.respondent_name = respondent_name.strip()
         st.session_state.respondent_unit = respondent_unit.strip()
         st.session_state.review_target = target
         st.session_state.sampling_method = sampling_method
         st.session_state.review_indices = review_indices
         st.session_state.review_position = 0
-        st.session_state.review_page_jump = 1
         st.session_state.study_responses = {}
         st.session_state.study_phase = "review"
         st.rerun()
@@ -1027,8 +1322,6 @@ if st.session_state.get("study_phase") == "final":
 st.session_state.study_phase = "review"
 if "review_position" not in st.session_state:
     st.session_state.review_position = 0
-if "review_page_jump" not in st.session_state:
-    st.session_state.review_page_jump = 1
 _set_review_position(int(st.session_state.review_position), review_target)
 
 st.subheader("Telaah komentar peer feedback")
@@ -1040,34 +1333,21 @@ render_review_navigation(review_target, "top")
 st.divider()
 
 review_position = int(st.session_state.review_position)
-source_row_index = int(review_indices[review_position])
-row = working_df.iloc[source_row_index]
-text = str(row[text_column]).strip()
-row_id = source_row_index + 1 if id_column_selection == "(gunakan nomor baris)" else row[id_column_selection]
+dataset_row_position = int(review_indices[review_position])
+row = working_df.iloc[dataset_row_position]
+source_row_index = int(row["source_row_index"])
+text = str(row["text"]).strip()
+row_id = str(row["row_id"])
 
-cache_key = hashlib.sha256(
-    f"{study_signature}:{source_row_index}:{text}".encode("utf-8")
-).hexdigest()
-
-if cache_key not in st.session_state.prediction_cache:
-    try:
-        model, tokenizer, thresholds, config, device = get_live_model(str(artifact_dir))
-        with st.spinner(f"Memprediksi komentar {review_position + 1}..."):
-            st.session_state.prediction_cache[cache_key] = predict_text(
-                text=text,
-                model=model,
-                tokenizer=tokenizer,
-                thresholds=thresholds,
-                config=config,
-                device=device,
-            )
-    except Exception as exc:
-        st.error(f"Prediksi gagal dijalankan: {exc}")
-        st.stop()
-
-result = st.session_state.prediction_cache[cache_key]
-predicted_labels = list(result.get("predicted_labels", []))
-predicted_spans = list(result.get("predicted_spans", []))
+result = {
+    "text": text,
+    "predicted_labels": list(row["predicted_labels"]),
+    "label_probabilities": dict(row["label_probabilities"]),
+    "predicted_spans": list(row["predicted_spans"]),
+    "truncated": bool(row.get("truncated", False)),
+}
+predicted_labels = list(result["predicted_labels"])
+predicted_spans = list(result["predicted_spans"])
 
 meta_1, meta_2, meta_3, meta_4 = st.columns(4)
 meta_1.metric("Urutan telaah", f"{review_position + 1}/{review_target}")
