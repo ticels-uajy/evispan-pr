@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import html
 import io
 import json
@@ -7,17 +8,18 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-import numpy as np
 import pandas as pd
 import streamlit as st
 
 from evispan_model import LABELS, load_artifacts, predict_text
 
+
 st.set_page_config(
-    page_title="EviSpan-PR Test Explorer",
+    page_title="EviSpan-PR Test Prediction Explorer",
     page_icon="🧾",
     layout="wide",
 )
+
 
 LABEL_COLORS = {
     "Problem": "#ffd6d6",
@@ -31,246 +33,78 @@ LABEL_BORDERS = {
     "Neutral": "#475467",
     "Appreciation": "#067647",
 }
+
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_ARTIFACT_DIR = Path(
     os.getenv("EVISPAN_ARTIFACT_DIR", str(PROJECT_DIR / "artifacts" / "evispan_pr"))
 )
+TEXT_COLUMN_CANDIDATES = [
+    "text",
+    "comment",
+    "feedback",
+    "review",
+    "sentence",
+    "content",
+    "peer_feedback",
+]
+ID_COLUMN_CANDIDATES = ["id", "sample_id", "row_id", "comment_id", "index"]
 
 
 @st.cache_data(show_spinner=False)
-def read_prediction_bytes(data: bytes, filename: str) -> List[Dict[str, Any]]:
+def read_test_dataset(data: bytes, filename: str) -> pd.DataFrame:
+    """Read an uploaded CSV, JSON, or JSONL test dataset."""
     suffix = Path(filename).suffix.lower()
+
     if suffix == ".csv":
-        df = pd.read_csv(io.BytesIO(data))
-        records = df.to_dict(orient="records")
+        frame = pd.read_csv(io.BytesIO(data))
     elif suffix == ".json":
-        parsed = json.loads(data.decode("utf-8"))
-        records = parsed if isinstance(parsed, list) else parsed.get("records", [])
-    else:
+        parsed = json.loads(data.decode("utf-8-sig"))
+        if isinstance(parsed, list):
+            records = parsed
+        elif isinstance(parsed, dict):
+            records = next(
+                (
+                    parsed[key]
+                    for key in ("records", "data", "items")
+                    if isinstance(parsed.get(key), list)
+                ),
+                [parsed],
+            )
+        else:
+            raise ValueError("JSON must contain an object or a list of objects.")
+        frame = pd.json_normalize(records)
+    elif suffix in {".jsonl", ".ndjson"}:
         records = [
             json.loads(line)
-            for line in data.decode("utf-8").splitlines()
+            for line in data.decode("utf-8-sig").splitlines()
             if line.strip()
         ]
-    return [normalise_record(record, i) for i, record in enumerate(records)]
+        frame = pd.json_normalize(records)
+    else:
+        raise ValueError("Unsupported file type. Use CSV, JSON, or JSONL.")
+
+    if frame.empty:
+        raise ValueError("The uploaded test dataset contains no rows.")
+
+    # Avoid ambiguous duplicate column names in Streamlit widgets.
+    if frame.columns.duplicated().any():
+        duplicated = frame.columns[frame.columns.duplicated()].tolist()
+        raise ValueError(f"Duplicate columns are not supported: {duplicated}")
+
+    return frame.reset_index(drop=True)
 
 
-@st.cache_data(show_spinner=False)
-def read_prediction_path(path: str) -> List[Dict[str, Any]]:
-    file_path = Path(path)
-    return read_prediction_bytes(file_path.read_bytes(), file_path.name)
-
-
-def parse_json_like(value: Any, default: Any) -> Any:
-    if value is None or (isinstance(value, float) and np.isnan(value)):
-        return default
-    if isinstance(value, (list, dict)):
-        return value
-    if isinstance(value, str):
-        value = value.strip()
-        if not value:
-            return default
-        try:
-            return json.loads(value)
-        except json.JSONDecodeError:
-            return [x.strip() for x in value.split(",") if x.strip()]
-    return default
-
-
-def first_present(record: Dict[str, Any], keys: List[str], default: Any) -> Any:
-    for key in keys:
-        if key in record and record[key] is not None:
-            return record[key]
-    return default
-
-
-def normalise_record(record: Dict[str, Any], index: int) -> Dict[str, Any]:
-    # Ground-truth keys supported by both the raw dataset and the exported file.
-    true_labels = parse_json_like(
-        first_present(
-            record,
-            [
-                "true_labels",
-                "doc_labels",
-                "labels",
-                "accept",
-                "classification_labels",
-                "label",
-            ],
-            [],
-        ),
-        [],
-    )
-
-    # Prediction keys must come from test_predictions.jsonl. They are not
-    # available in the original peer-review dataset.
-    prediction_keys = {
-        "predicted_labels",
-        "pred_labels",
-        "label_probabilities",
-        "pred_probs",
-        "predicted_spans",
-        "pred_spans",
-    }
-    prediction_fields_present = bool(prediction_keys.intersection(record.keys()))
-
-    predicted_labels = parse_json_like(
-        first_present(record, ["predicted_labels", "pred_labels"], []), []
-    )
-    probabilities = parse_json_like(
-        first_present(record, ["label_probabilities", "pred_probs"], {}), {}
-    )
-    true_spans = parse_json_like(
-        first_present(record, ["true_spans", "spans", "entities"], []), []
-    )
-    predicted_spans = parse_json_like(
-        first_present(record, ["predicted_spans", "pred_spans"], []), []
-    )
-
-    # Support flattened probability columns from CSV exports.
-    if not probabilities:
-        probabilities = {
-            label: float(record.get(f"prob_{label.lower()}", np.nan))
-            for label in LABELS
-            if pd.notna(record.get(f"prob_{label.lower()}", np.nan))
-        }
-
-    return {
-        **record,
-        "row_index": index,
-        "id": record.get("id", record.get("sample_id", index)),
-        "text": str(record.get("text", record.get("comment", ""))),
-        "true_labels": [x for x in true_labels if x in LABELS],
-        "predicted_labels": [x for x in predicted_labels if x in LABELS],
-        "label_probabilities": {
-            label: float(probabilities.get(label, np.nan)) for label in LABELS
-        },
-        "true_spans": normalise_spans(true_spans),
-        "predicted_spans": normalise_spans(predicted_spans),
-        "_prediction_fields_present": prediction_fields_present,
-    }
-
-
-def normalise_spans(spans: Any) -> List[Dict[str, Any]]:
-    output: List[Dict[str, Any]] = []
-    if not isinstance(spans, list):
-        return output
-    for span in spans:
-        if not isinstance(span, dict):
-            continue
-        label = span.get("label")
-        if label not in LABELS:
-            continue
-        try:
-            start = int(span.get("start"))
-            end = int(span.get("end"))
-        except (TypeError, ValueError):
-            continue
-        if start >= end:
-            continue
-        output.append(
-            {
-                "start": start,
-                "end": end,
-                "label": label,
-                "text": str(span.get("text", "")),
-            }
-        )
-    return sorted(output, key=lambda x: (x["start"], x["end"], x["label"]))
-
-
-def set_equal(a: Iterable[str], b: Iterable[str]) -> bool:
-    return set(a) == set(b)
-
-
-def label_badges(labels: Iterable[str]) -> str:
-    labels = list(labels)
-    if not labels:
-        return '<span class="empty-badge">None</span>'
-    parts = []
-    for label in labels:
-        parts.append(
-            f'<span class="label-badge" style="background:{LABEL_COLORS[label]};'
-            f'border-color:{LABEL_BORDERS[label]};color:{LABEL_BORDERS[label]}">'
-            f'{html.escape(label)}</span>'
-        )
-    return " ".join(parts)
-
-
-def render_highlighted_text(text: str, spans: List[Dict[str, Any]]) -> str:
-    """Highlight non-overlapping predicted or gold spans by character offsets."""
-    safe_spans: List[Dict[str, Any]] = []
-    cursor = 0
-    for span in sorted(spans, key=lambda x: (x["start"], -(x["end"] - x["start"]))):
-        start = max(0, min(int(span["start"]), len(text)))
-        end = max(0, min(int(span["end"]), len(text)))
-        if start < cursor or start >= end:
-            continue
-        safe_spans.append({**span, "start": start, "end": end})
-        cursor = end
-
-    parts: List[str] = []
-    cursor = 0
-    for span in safe_spans:
-        start, end, label = span["start"], span["end"], span["label"]
-        parts.append(html.escape(text[cursor:start]))
-        parts.append(
-            f'<span class="evidence" style="background:{LABEL_COLORS[label]};'
-            f'border-bottom:3px solid {LABEL_BORDERS[label]};" '
-            f'title="{html.escape(label)} [{start}:{end}]">'
-            f'{html.escape(text[start:end])}'
-            f'<small>{html.escape(label)}</small></span>'
-        )
-        cursor = end
-    parts.append(html.escape(text[cursor:]))
-    return '<div class="comment-box">' + "".join(parts).replace("\n", "<br>") + "</div>"
-
-
-def spans_dataframe(spans: List[Dict[str, Any]]) -> pd.DataFrame:
-    if not spans:
-        return pd.DataFrame(columns=["Label", "Start", "End", "Evidence"])
-    return pd.DataFrame(
-        [
-            {
-                "Label": s["label"],
-                "Start": s["start"],
-                "End": s["end"],
-                "Evidence": s.get("text", ""),
-            }
-            for s in spans
-        ]
-    )
-
-
-def probability_dataframe(record: Dict[str, Any]) -> pd.DataFrame:
-    return pd.DataFrame(
-        [
-            {
-                "Label": label,
-                "Probability": record["label_probabilities"].get(label, np.nan),
-                "Predicted": label in record["predicted_labels"],
-                "Ground truth": label in record["true_labels"],
-            }
-            for label in LABELS
-        ]
-    )
-
-
-def records_to_dataframe(records: List[Dict[str, Any]]) -> pd.DataFrame:
-    rows = []
-    for r in records:
-        rows.append(
-            {
-                "row_index": r["row_index"],
-                "id": r["id"],
-                "text": r["text"],
-                "true_labels": ", ".join(r["true_labels"]),
-                "predicted_labels": ", ".join(r["predicted_labels"]),
-                "exact_match": set_equal(r["true_labels"], r["predicted_labels"]),
-                "n_predicted_spans": len(r["predicted_spans"]),
-            }
-        )
-    return pd.DataFrame(rows)
+def preferred_column(
+    columns: Iterable[str],
+    candidates: List[str],
+    fallback_to_first: bool = True,
+) -> Optional[str]:
+    columns = list(columns)
+    lower_to_original = {str(column).lower(): str(column) for column in columns}
+    for candidate in candidates:
+        if candidate in lower_to_original:
+            return lower_to_original[candidate]
+    return str(columns[0]) if columns and fallback_to_first else None
 
 
 def artifact_is_complete(path: Path) -> bool:
@@ -284,342 +118,380 @@ def artifact_is_complete(path: Path) -> bool:
     return all(item.exists() for item in required)
 
 
-def prediction_payload_is_valid(records: List[Dict[str, Any]]) -> bool:
-    """Return True only for exported records that contain model outputs."""
-    return bool(records) and all(
-        bool(record.get("_prediction_fields_present")) for record in records
+@st.cache_resource(show_spinner="Memuat model EviSpan-PR...")
+def get_live_model(artifact_dir: str):
+    return load_artifacts(artifact_dir)
+
+
+def label_badges(labels: Iterable[str]) -> str:
+    labels = list(labels)
+    if not labels:
+        return '<span class="empty-badge">Tidak ada label</span>'
+
+    badges = []
+    for label in labels:
+        color = LABEL_COLORS.get(label, "#f2f4f7")
+        border = LABEL_BORDERS.get(label, "#475467")
+        badges.append(
+            f'<span class="label-badge" style="background:{color};'
+            f'border-color:{border};color:{border}">{html.escape(label)}</span>'
+        )
+    return " ".join(badges)
+
+
+def render_plain_text(text: str) -> str:
+    escaped = html.escape(text).replace("\n", "<br>")
+    return f'<div class="comment-box plain-text">{escaped}</div>'
+
+
+def render_highlighted_text(text: str, spans: List[Dict[str, Any]]) -> str:
+    """Highlight valid, non-overlapping evidence spans using character offsets."""
+    safe_spans: List[Dict[str, Any]] = []
+    cursor = 0
+
+    for span in sorted(
+        spans,
+        key=lambda item: (
+            int(item.get("start", 0)),
+            -(int(item.get("end", 0)) - int(item.get("start", 0))),
+        ),
+    ):
+        try:
+            start = max(0, min(int(span["start"]), len(text)))
+            end = max(0, min(int(span["end"]), len(text)))
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        label = str(span.get("label", ""))
+        if label not in LABELS or start < cursor or start >= end:
+            continue
+
+        safe_spans.append({**span, "start": start, "end": end, "label": label})
+        cursor = end
+
+    if not safe_spans:
+        return render_plain_text(text)
+
+    parts: List[str] = []
+    cursor = 0
+    for span in safe_spans:
+        start = int(span["start"])
+        end = int(span["end"])
+        label = str(span["label"])
+        parts.append(html.escape(text[cursor:start]))
+        parts.append(
+            f'<span class="evidence" style="background:{LABEL_COLORS[label]};'
+            f'border-bottom:3px solid {LABEL_BORDERS[label]};" '
+            f'title="{html.escape(label)} [{start}:{end}]">'
+            f'{html.escape(text[start:end])}'
+            f'<small>{html.escape(label)}</small></span>'
+        )
+        cursor = end
+
+    parts.append(html.escape(text[cursor:]))
+    return (
+        '<div class="comment-box evidence-text">'
+        + "".join(parts).replace("\n", "<br>")
+        + "</div>"
     )
 
 
-@st.cache_resource(show_spinner="Loading EviSpan-PR model...")
-def get_live_model(artifact_dir: str):
-    return load_artifacts(artifact_dir)
+def spans_dataframe(spans: List[Dict[str, Any]]) -> pd.DataFrame:
+    columns = ["Label", "Evidence", "Start", "End"]
+    if not spans:
+        return pd.DataFrame(columns=columns)
+
+    return pd.DataFrame(
+        [
+            {
+                "Label": span.get("label", ""),
+                "Evidence": span.get("text", ""),
+                "Start": span.get("start", ""),
+                "End": span.get("end", ""),
+            }
+            for span in spans
+        ],
+        columns=columns,
+    )
+
+
+def probabilities_dataframe(result: Dict[str, Any]) -> pd.DataFrame:
+    probabilities = result.get("label_probabilities", {})
+    predicted = set(result.get("predicted_labels", []))
+    return pd.DataFrame(
+        [
+            {
+                "Label": label,
+                "Probability": float(probabilities.get(label, 0.0)),
+                "Predicted": label in predicted,
+            }
+            for label in LABELS
+        ]
+    )
+
+
+def _set_page(index: int, total: int) -> None:
+    bounded = max(0, min(index, total - 1))
+    st.session_state.current_row = bounded
+    st.session_state.page_jump = bounded + 1
+
+
+def _previous_page(total: int) -> None:
+    _set_page(int(st.session_state.current_row) - 1, total)
+
+
+def _next_page(total: int) -> None:
+    _set_page(int(st.session_state.current_row) + 1, total)
+
+
+def _jump_to_page(total: int) -> None:
+    requested = int(st.session_state.page_jump) - 1
+    st.session_state.current_row = max(0, min(requested, total - 1))
+
+
+def render_navigation(total: int, key_prefix: str) -> None:
+    current = int(st.session_state.current_row)
+    previous_col, page_col, next_col = st.columns([1, 2, 1])
+
+    previous_col.button(
+        "← Previous",
+        key=f"{key_prefix}_previous",
+        use_container_width=True,
+        disabled=current <= 0,
+        on_click=_previous_page,
+        args=(total,),
+    )
+    page_col.number_input(
+        "Baris",
+        min_value=1,
+        max_value=total,
+        step=1,
+        key="page_jump",
+        on_change=_jump_to_page,
+        args=(total,),
+        label_visibility="collapsed",
+    )
+    next_col.button(
+        "Next →",
+        key=f"{key_prefix}_next",
+        use_container_width=True,
+        disabled=current >= total - 1,
+        on_click=_next_page,
+        args=(total,),
+    )
+    st.caption(f"Baris {current + 1:,} dari {total:,}")
 
 
 st.markdown(
     """
 <style>
+.block-container {max-width: 1180px; padding-top: 2rem; padding-bottom: 3rem;}
 .label-badge, .empty-badge {
-    display:inline-block; padding:0.25rem 0.55rem; margin:0.08rem;
-    border:1px solid #98a2b3; border-radius:999px; font-weight:650;
+    display:inline-block; padding:0.30rem 0.68rem; margin:0.10rem 0.14rem 0.10rem 0;
+    border:1px solid #98a2b3; border-radius:999px; font-weight:700;
 }
 .empty-badge {background:#f2f4f7; color:#475467;}
 .comment-box {
-    border:1px solid #d0d5dd; border-radius:10px; padding:1rem 1.1rem;
-    line-height:2.05; font-size:1.02rem; background:#ffffff;
+    border:1px solid #d0d5dd; border-radius:12px; padding:1.15rem 1.25rem;
+    line-height:2.05; font-size:1.05rem; background:#ffffff; color:#101828;
 }
-.evidence {padding:0.10rem 0.18rem; border-radius:4px; position:relative;}
+.plain-text {line-height:1.75;}
+.evidence {padding:0.12rem 0.20rem; border-radius:5px; position:relative;}
 .evidence small {
-    font-size:0.62rem; margin-left:0.25rem; padding:0.08rem 0.20rem;
-    border-radius:3px; background:rgba(255,255,255,0.76); font-weight:700;
+    font-size:0.62rem; margin-left:0.28rem; padding:0.08rem 0.22rem;
+    border-radius:3px; background:rgba(255,255,255,0.80); font-weight:750;
 }
-.section-label {font-size:0.83rem; color:#667085; font-weight:700; text-transform:uppercase;}
+.section-label {
+    font-size:0.82rem; color:#667085; font-weight:750; text-transform:uppercase;
+    letter-spacing:0.035em; margin-bottom:0.35rem;
+}
+.row-meta {
+    border:1px solid #eaecf0; border-radius:10px; padding:0.70rem 0.85rem;
+    background:#f9fafb; color:#344054;
+}
 </style>
 """,
     unsafe_allow_html=True,
 )
 
-st.title("EviSpan-PR Test Data and Prediction Explorer")
+st.title("EviSpan-PR Test Prediction Explorer")
 st.caption(
-    "Explore test comments, multi-label predictions, class probabilities, and CRF-based evidence spans."
+    "Upload test dataset, lalu amati teks, label hasil prediksi, dan evidence span untuk setiap baris."
 )
 
 with st.sidebar:
-    st.header("Data source")
+    st.header("Test dataset")
     uploaded = st.file_uploader(
-        "Upload exported test predictions",
-        type=["jsonl", "json", "csv"],
-        help="Expected file: test_predictions.jsonl generated by the export cell.",
+        "Upload test dataset",
+        type=["csv", "json", "jsonl", "ndjson"],
+        help="Dataset harus memiliki minimal satu kolom teks.",
     )
-    default_prediction_path = DEFAULT_ARTIFACT_DIR / "test_predictions.jsonl"
-    st.caption(f"Default artifact directory: `{DEFAULT_ARTIFACT_DIR}`")
-    st.caption(
-        "Upload the exported `test_predictions.jsonl`. The original "
-        "`peer-review-masdig-final.jsonl` contains annotations only and has no model predictions."
+    artifact_dir_text = st.text_input(
+        "Model artifact directory",
+        value=str(DEFAULT_ARTIFACT_DIR),
+        help="Folder yang berisi model_state.pt, thresholds.json, tokenizer, dan encoder_config.",
     )
+
+if uploaded is None:
+    st.info("Upload test dataset melalui panel sebelah kiri untuk mulai melakukan prediksi.")
+    st.stop()
 
 try:
-    if uploaded is not None:
-        records = read_prediction_bytes(uploaded.getvalue(), uploaded.name)
-        source_label = uploaded.name
-    elif default_prediction_path.exists():
-        records = read_prediction_path(str(default_prediction_path))
-        source_label = str(default_prediction_path)
-    else:
-        records = []
-        source_label = "Not loaded"
+    uploaded_bytes = uploaded.getvalue()
+    test_df = read_test_dataset(uploaded_bytes, uploaded.name)
 except Exception as exc:
-    st.error(f"Could not read prediction data: {exc}")
-    records = []
-    source_label = "Read error"
+    st.error(f"Test dataset tidak dapat dibaca: {exc}")
+    st.stop()
 
-prediction_payload_ok = prediction_payload_is_valid(records)
-
-if not records:
-    st.info(
-        "No test prediction file has been loaded. Run the export cell added to the notebook, "
-        "then place `test_predictions.jsonl` in `artifacts/evispan_pr/`, or upload it in the sidebar."
-    )
-elif not prediction_payload_ok:
-    st.error(
-        "The uploaded file contains raw peer-review records, but no EviSpan-PR prediction fields. "
-        "Upload `test_predictions.jsonl` generated by `export_streamlit_artifacts.py`, not the original dataset."
-    )
-    st.code(
-        "Required prediction fields: predicted_labels, label_probabilities, predicted_spans",
-        language="text",
-    )
-
-summary_tab, explorer_tab, inference_tab = st.tabs(
-    ["Batch summary", "Test data explorer", "New comment inference"]
+available_columns = [str(column) for column in test_df.columns]
+default_text_column = preferred_column(available_columns, TEXT_COLUMN_CANDIDATES)
+default_text_index = (
+    available_columns.index(default_text_column)
+    if default_text_column in available_columns
+    else 0
 )
 
-with summary_tab:
-    if not records:
-        st.warning("Load test predictions to view the summary.")
-    elif not prediction_payload_ok:
-        st.warning(
-            "This is a raw dataset, so performance metrics cannot be calculated. "
-            "The table below is only a ground-truth preview."
-        )
-        preview = pd.DataFrame(
-            [
-                {
-                    "id": r["id"],
-                    "text": r["text"],
-                    "true_labels": ", ".join(r["true_labels"]),
-                    "n_true_spans": len(r["true_spans"]),
-                }
-                for r in records[:100]
-            ]
-        )
-        st.dataframe(preview, use_container_width=True, hide_index=True)
-    else:
-        df_all = records_to_dataframe(records)
-        exact_rate = float(df_all["exact_match"].mean()) if len(df_all) else 0.0
-        total_spans = int(df_all["n_predicted_spans"].sum())
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Test comments", f"{len(records):,}")
-        c2.metric("Exact label match", f"{exact_rate:.1%}")
-        c3.metric("Predicted evidence spans", f"{total_spans:,}")
-        c4.metric("Source", Path(source_label).name)
+with st.sidebar:
+    text_column = st.selectbox(
+        "Kolom teks",
+        options=available_columns,
+        index=default_text_index,
+    )
 
-        rows = []
-        for label in LABELS:
-            true = np.array([label in r["true_labels"] for r in records], dtype=int)
-            pred = np.array(
-                [label in r["predicted_labels"] for r in records], dtype=int
+    id_options = ["(gunakan nomor baris)"] + available_columns
+    preferred_id = preferred_column(
+        available_columns,
+        ID_COLUMN_CANDIDATES,
+        fallback_to_first=False,
+    )
+    default_id_index = (
+        id_options.index(preferred_id)
+        if preferred_id in id_options
+        else 0
+    )
+    id_column_selection = st.selectbox(
+        "Kolom ID",
+        options=id_options,
+        index=default_id_index,
+    )
+
+# Keep only usable test rows. The displayed numbering still follows this cleaned view.
+working_df = test_df.copy()
+working_df[text_column] = working_df[text_column].fillna("").astype(str)
+working_df = working_df[working_df[text_column].str.strip().ne("")].reset_index(drop=True)
+
+if working_df.empty:
+    st.error(f"Kolom `{text_column}` tidak memiliki teks yang dapat diprediksi.")
+    st.stop()
+
+artifact_dir = Path(artifact_dir_text).expanduser().resolve()
+if not artifact_is_complete(artifact_dir):
+    st.error(
+        "Model artifact belum lengkap. Pastikan folder berisi `artifact_config.json`, "
+        "`thresholds.json`, `model_state.pt`, `encoder_config/config.json`, dan folder `tokenizer`."
+    )
+    st.code(str(artifact_dir), language="text")
+    st.stop()
+
+file_signature = hashlib.sha256(uploaded_bytes).hexdigest()
+dataset_signature = f"{file_signature}:{text_column}:{len(working_df)}"
+model_state_path = artifact_dir / "model_state.pt"
+model_signature = f"{artifact_dir}:{model_state_path.stat().st_mtime_ns}"
+
+if st.session_state.get("active_dataset_signature") != dataset_signature:
+    st.session_state.active_dataset_signature = dataset_signature
+    st.session_state.current_row = 0
+    st.session_state.page_jump = 1
+    st.session_state.prediction_cache = {}
+
+if "current_row" not in st.session_state:
+    st.session_state.current_row = 0
+if "page_jump" not in st.session_state:
+    st.session_state.page_jump = 1
+if "prediction_cache" not in st.session_state:
+    st.session_state.prediction_cache = {}
+
+_set_page(int(st.session_state.current_row), len(working_df))
+render_navigation(len(working_df), "top")
+st.divider()
+
+row_position = int(st.session_state.current_row)
+row = working_df.iloc[row_position]
+text = str(row[text_column]).strip()
+row_id = (
+    row_position + 1
+    if id_column_selection == "(gunakan nomor baris)"
+    else row[id_column_selection]
+)
+
+cache_key = hashlib.sha256(
+    f"{dataset_signature}:{model_signature}:{row_position}:{text}".encode("utf-8")
+).hexdigest()
+
+if cache_key not in st.session_state.prediction_cache:
+    try:
+        model, tokenizer, thresholds, config, device = get_live_model(str(artifact_dir))
+        with st.spinner(f"Memprediksi baris {row_position + 1:,}..."):
+            st.session_state.prediction_cache[cache_key] = predict_text(
+                text=text,
+                model=model,
+                tokenizer=tokenizer,
+                thresholds=thresholds,
+                config=config,
+                device=device,
             )
-            tp = int(((true == 1) & (pred == 1)).sum())
-            fp = int(((true == 0) & (pred == 1)).sum())
-            fn = int(((true == 1) & (pred == 0)).sum())
-            precision = tp / (tp + fp) if tp + fp else 0.0
-            recall = tp / (tp + fn) if tp + fn else 0.0
-            f1 = (
-                2 * precision * recall / (precision + recall)
-                if precision + recall
-                else 0.0
-            )
-            rows.append(
-                {
-                    "Label": label,
-                    "Gold support": int(true.sum()),
-                    "Predicted": int(pred.sum()),
-                    "Precision": precision,
-                    "Recall": recall,
-                    "F1": f1,
-                }
-            )
-        st.subheader("Document-level performance from exported predictions")
-        st.dataframe(
-            pd.DataFrame(rows),
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Precision": st.column_config.NumberColumn(format="%.3f"),
-                "Recall": st.column_config.NumberColumn(format="%.3f"),
-                "F1": st.column_config.NumberColumn(format="%.3f"),
-            },
-        )
+    except Exception as exc:
+        st.error(f"Prediksi gagal dijalankan pada baris ini: {exc}")
+        st.stop()
 
-        st.subheader("Test records")
-        st.dataframe(
-            df_all,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "text": st.column_config.TextColumn(width="large"),
-                "exact_match": st.column_config.CheckboxColumn(),
-            },
-        )
-        st.download_button(
-            "Download summary CSV",
-            data=df_all.to_csv(index=False).encode("utf-8"),
-            file_name="evispan_test_summary.csv",
-            mime="text/csv",
-        )
+result = st.session_state.prediction_cache[cache_key]
+predicted_labels = result.get("predicted_labels", [])
+predicted_spans = result.get("predicted_spans", [])
 
-with explorer_tab:
-    if not records:
-        st.warning("Load test predictions to explore individual records.")
-    elif not prediction_payload_ok:
-        st.warning(
-            "Predicted labels, probabilities, and evidence spans are unavailable because the uploaded "
-            "file is the original dataset rather than an exported prediction file."
-        )
-    else:
-        st.subheader("Filter test comments")
-        f1, f2, f3 = st.columns([1, 1, 2])
-        match_filter = f1.selectbox(
-            "Label result", ["All", "Exact match", "Mismatch"]
-        )
-        label_filter = f2.selectbox("Contains label", ["All"] + LABELS)
-        text_query = f3.text_input("Search comment text")
+meta_1, meta_2, meta_3 = st.columns(3)
+meta_1.metric("ID data", str(row_id))
+meta_2.metric("Jumlah label", len(predicted_labels))
+meta_3.metric("Jumlah evidence span", len(predicted_spans))
 
-        filtered = []
-        for record in records:
-            is_exact = set_equal(record["true_labels"], record["predicted_labels"])
-            if match_filter == "Exact match" and not is_exact:
-                continue
-            if match_filter == "Mismatch" and is_exact:
-                continue
-            if label_filter != "All" and label_filter not in set(
-                record["true_labels"] + record["predicted_labels"]
-            ):
-                continue
-            if text_query and text_query.lower() not in record["text"].lower():
-                continue
-            filtered.append(record)
+st.markdown('<div class="section-label">Teks pada test dataset</div>', unsafe_allow_html=True)
+st.markdown(render_plain_text(text), unsafe_allow_html=True)
 
-        st.caption(f"Showing {len(filtered):,} of {len(records):,} comments")
-        if not filtered:
-            st.warning("No record matches the current filters.")
-        else:
-            options = {
-                f"{i + 1}. ID {record['id']} — {record['text'][:80]}": record
-                for i, record in enumerate(filtered)
-            }
-            selected_key = st.selectbox("Select a test comment", list(options.keys()))
-            record = options[selected_key]
+st.markdown('<div class="section-label" style="margin-top:1.35rem">Prediksi label</div>', unsafe_allow_html=True)
+st.markdown(label_badges(predicted_labels), unsafe_allow_html=True)
 
-            exact = set_equal(record["true_labels"], record["predicted_labels"])
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Record ID", str(record["id"]))
-            m2.metric("Predicted spans", len(record["predicted_spans"]))
-            m3.metric("Document labels", "Exact" if exact else "Mismatch")
+st.markdown('<div class="section-label" style="margin-top:1.35rem">Evidence span hasil prediksi</div>', unsafe_allow_html=True)
+st.markdown(render_highlighted_text(text, predicted_spans), unsafe_allow_html=True)
 
-            c_gold, c_pred = st.columns(2)
-            with c_gold:
-                st.markdown('<div class="section-label">Ground-truth labels</div>', unsafe_allow_html=True)
-                st.markdown(label_badges(record["true_labels"]), unsafe_allow_html=True)
-            with c_pred:
-                st.markdown('<div class="section-label">Predicted labels</div>', unsafe_allow_html=True)
-                st.markdown(
-                    label_badges(record["predicted_labels"]), unsafe_allow_html=True
-                )
+if predicted_spans:
+    st.dataframe(
+        spans_dataframe(predicted_spans),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Evidence": st.column_config.TextColumn(width="large"),
+            "Start": st.column_config.NumberColumn(format="%d"),
+            "End": st.column_config.NumberColumn(format="%d"),
+        },
+    )
+else:
+    st.warning("Model tidak menghasilkan evidence span untuk baris ini.")
 
-            st.subheader("Predicted evidence spans")
-            st.markdown(
-                render_highlighted_text(record["text"], record["predicted_spans"]),
-                unsafe_allow_html=True,
-            )
-
-            with st.expander("Compare with ground-truth spans", expanded=False):
-                st.markdown(
-                    render_highlighted_text(record["text"], record["true_spans"]),
-                    unsafe_allow_html=True,
-                )
-
-            left, right = st.columns([1, 1])
-            with left:
-                st.subheader("Label probabilities")
-                st.dataframe(
-                    probability_dataframe(record),
-                    hide_index=True,
-                    use_container_width=True,
-                    column_config={
-                        "Probability": st.column_config.ProgressColumn(
-                            min_value=0.0, max_value=1.0, format="%.3f"
-                        )
-                    },
-                )
-            with right:
-                st.subheader("Evidence span details")
-                st.dataframe(
-                    spans_dataframe(record["predicted_spans"]),
-                    hide_index=True,
-                    use_container_width=True,
-                )
-
-            with st.expander("Raw exported record"):
-                st.json(record)
-
-with inference_tab:
-    if not artifact_is_complete(DEFAULT_ARTIFACT_DIR):
-        st.warning(
-            "Live inference is unavailable because the full model artifacts have not been found. "
-            "The test-data viewer still works with the precomputed prediction file."
-        )
-        st.code(
-            "Required: artifact_config.json, thresholds.json, model_state.pt, "
-            "encoder_config/config.json, and tokenizer/",
-            language="text",
-        )
-    else:
-        st.subheader("Run EviSpan-PR on a new peer-review comment")
-        text = st.text_area(
-            "Peer-review comment",
-            value=(
-                "Materi sudah disampaikan dengan jelas dan menarik. Namun, bagian evaluasi "
-                "masih kurang mendalam. Sebaiknya tambahkan contoh data dan penjelasan metode "
-                "yang lebih rinci."
+with st.expander("Lihat probabilitas setiap label", expanded=False):
+    st.dataframe(
+        probabilities_dataframe(result),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Probability": st.column_config.ProgressColumn(
+                min_value=0.0,
+                max_value=1.0,
+                format="%.3f",
             ),
-            height=150,
-        )
-        if st.button("Predict", type="primary"):
-            try:
-                model, tokenizer, thresholds, config, device = get_live_model(
-                    str(DEFAULT_ARTIFACT_DIR)
-                )
-                with st.spinner("Running document and span prediction..."):
-                    result = predict_text(
-                        text, model, tokenizer, thresholds, config, device
-                    )
-                st.markdown(
-                    '<div class="section-label">Predicted labels</div>',
-                    unsafe_allow_html=True,
-                )
-                st.markdown(
-                    label_badges(result["predicted_labels"]), unsafe_allow_html=True
-                )
-                st.markdown(
-                    render_highlighted_text(text, result["predicted_spans"]),
-                    unsafe_allow_html=True,
-                )
-                st.dataframe(
-                    pd.DataFrame(
-                        [
-                            {
-                                "Label": label,
-                                "Probability": result["label_probabilities"][label],
-                                "Threshold": float(thresholds[i]),
-                                "Predicted": label in result["predicted_labels"],
-                            }
-                            for i, label in enumerate(LABELS)
-                        ]
-                    ),
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "Probability": st.column_config.ProgressColumn(
-                            min_value=0.0, max_value=1.0, format="%.3f"
-                        ),
-                        "Threshold": st.column_config.NumberColumn(format="%.2f"),
-                    },
-                )
-                if result.get("truncated"):
-                    st.info(
-                        "The input exceeded the configured maximum token length and was truncated."
-                    )
-            except Exception as exc:
-                st.exception(exc)
+            "Predicted": st.column_config.CheckboxColumn(),
+        },
+    )
+
+if result.get("truncated"):
+    st.info("Teks melebihi panjang maksimum model dan dipotong saat inferensi.")
+
+st.caption("Gunakan tombol Previous/Next atau nomor baris di bagian atas untuk berpindah data.")
