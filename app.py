@@ -15,7 +15,7 @@ from evispan_model import LABELS, load_artifacts, predict_text
 
 
 st.set_page_config(
-    page_title="EviSpan-PR Test Prediction Explorer",
+    page_title="EviSpan-PR: Evidence-Grounded Multi-Label Peer Review Feedback Analysis",
     page_icon="🧾",
     layout="wide",
 )
@@ -314,9 +314,15 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("EviSpan-PR Test Prediction Explorer")
+st.title(
+    "EviSpan-PR: Evidence-Grounded Multi-Label Peer Review Feedback Analysis"
+)
+
 st.caption(
-    "Upload test dataset, lalu amati teks, label hasil prediksi, dan evidence span untuk setiap baris."
+    "Unggah test dataset untuk menelaah prediksi kategori feedback pada tingkat "
+    "komentar—Problem, Suggestion, Neutral, dan Appreciation—serta evidence span "
+    "yang mendukung setiap label, sehingga dosen dapat memverifikasi hasil analisis "
+    "model secara transparan."
 )
 
 with st.sidebar:
